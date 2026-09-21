@@ -339,6 +339,10 @@ async fn dispatch(req: Request, db: &DbCache, names: &tokio::sync::RwLock<Arc<Na
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        SnsRaw { tid, limit } => match query::q_sns_raw(db, tid, limit).await {
+            Ok(v) => Response::ok(v),
+            Err(e) => Response::err(e.to_string()),
+        },
         ReloadConfig => match reload_config(db, names).await {
             Ok(v) => Response::ok(v),
             Err(e) => Response::err(e.to_string()),
@@ -423,6 +427,7 @@ async fn reload_config(
             msg_db_keys: Vec::new(),
             biz_msg_db_keys: Vec::new(),
             verify_flags: Default::default(),
+            contact_extra: Default::default(),
         }
     });
     let mut new_names = names_raw;

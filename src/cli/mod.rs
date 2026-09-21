@@ -17,6 +17,7 @@ pub mod search;
 pub mod sessions;
 pub mod sns_feed;
 pub mod sns_notifications;
+pub mod sns_raw;
 pub mod sns_search;
 pub mod stats;
 pub mod timeline;
@@ -271,6 +272,18 @@ enum Commands {
         /// 输出 JSON（默认 YAML）
         #[arg(long)]
         json: bool,
+    },
+    /// 调试用：dump SnsTimeLine.content 原始 XML，核对 schema（隐藏）
+    #[command(hide = true)]
+    SnsRaw {
+        /// 指定 tid；不传则按 tid DESC 取最近 N 条
+        tid: Option<i64>,
+        /// 最多 dump 多少条（仅在不指定 tid 时生效）
+        #[arg(short = 'n', long, default_value = "5")]
+        limit: usize,
+        /// 输出 YAML（默认 JSON，更适合保留 XML 转义）
+        #[arg(long = "yaml")]
+        yaml: bool,
     },
     /// 朋友圈全文搜索：匹配正文关键词
     SnsSearch {
@@ -592,6 +605,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             user,
             json,
         } => sns_feed::cmd_sns_feed(limit, since, until, user, json),
+        Commands::SnsRaw { tid, limit, yaml } => sns_raw::cmd_sns_raw(tid, limit, !yaml),
         Commands::SnsSearch {
             keyword,
             limit,

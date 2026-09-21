@@ -147,6 +147,15 @@ pub enum Request {
         #[serde(default)]
         unread: bool,
     },
+    /// 调试用：dump 一条或多条 SnsTimeLine 的原始 XML，用于核对 schema
+    /// （likeUserList / commentUserList 真实标签名等）。隐藏命令，不进 README。
+    SnsRaw {
+        /// 指定 tid；None 表示按 tid DESC 取最近 N 条
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tid: Option<i64>,
+        #[serde(default = "default_limit_5")]
+        limit: usize,
+    },
     /// 朋友圈全文搜索（匹配 contentDesc）
     SnsSearch {
         keyword: String,
@@ -253,6 +262,9 @@ fn default_limit_50() -> usize {
 }
 fn default_limit_200() -> usize {
     200
+}
+fn default_limit_5() -> usize {
+    5
 }
 fn is_false(v: &bool) -> bool {
     !*v

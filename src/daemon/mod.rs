@@ -97,6 +97,7 @@ async fn async_run() -> Result<()> {
             msg_db_keys: Vec::new(),
             biz_msg_db_keys: Vec::new(),
             verify_flags: HashMap::new(),
+            contact_extra: HashMap::new(),
         }
     });
     let mut names = names_raw;

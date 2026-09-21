@@ -59,6 +59,8 @@ pub struct Names {
     pub biz_msg_db_keys: Vec<String>,
     /// username -> contact.verify_flag（0=真人，非 0 通常为公众号/服务号/认证账号）
     pub verify_flags: HashMap<String, i64>,
+    /// username -> (来源 code from extra_buffer field 8, 添加时间 unix 秒 from field 41)
+    pub contact_extra: HashMap<String, (Option<i64>, Option<i64>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -229,27 +231,31 @@ pub async fn load_names(db: &DbCache) -> Result<Names> {
     let path = db.get("contact/contact.db").await?;
     let mut map = HashMap::new();
     let mut verify_flags: HashMap<String, i64> = HashMap::new();
+    let mut contact_extra: HashMap<String, (Option<i64>, Option<i64>)> = HashMap::new();
     if let Some(p) = path {
         let p2 = p.clone();
-        let rows: Vec<(String, String, String, i64)> = tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(&p2).context("打开 contact.db 失败")?;
-            let mut stmt =
-                conn.prepare("SELECT username, nick_name, remark, verify_flag FROM contact")?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1).unwrap_or_default(),
-                        row.get::<_, String>(2).unwrap_or_default(),
-                        row.get::<_, i64>(3).unwrap_or(0),
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok::<_, anyhow::Error>(rows)
-        })
-        .await??;
+        let rows: Vec<(String, String, String, i64, Option<Vec<u8>>)> =
+            tokio::task::spawn_blocking(move || {
+                let conn = Connection::open(&p2).context("打开 contact.db 失败")?;
+                let mut stmt = conn.prepare(
+                    "SELECT username, nick_name, remark, verify_flag, extra_buffer FROM contact",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1).unwrap_or_default(),
+                            row.get::<_, String>(2).unwrap_or_default(),
+                            row.get::<_, i64>(3).unwrap_or(0),
+                            row.get::<_, Option<Vec<u8>>>(4).ok().flatten(),
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok::<_, anyhow::Error>(rows)
+            })
+            .await??;
 
-        for (uname, nick, remark, vf) in rows {
+        for (uname, nick, remark, vf, extra) in rows {
             let display = if !remark.is_empty() {
                 remark
             } else if !nick.is_empty() {
@@ -258,6 +264,12 @@ pub async fn load_names(db: &DbCache) -> Result<Names> {
                 uname.clone()
             };
             verify_flags.insert(uname.clone(), vf);
+            if let Some(buf) = extra {
+                let parsed = parse_contact_extra(&buf);
+                if parsed.0.is_some() || parsed.1.is_some() {
+                    contact_extra.insert(uname.clone(), parsed);
+                }
+            }
             map.insert(uname, display);
         }
     }
@@ -273,7 +285,147 @@ pub async fn load_names(db: &DbCache) -> Result<Names> {
         msg_db_keys: Vec::new(),
         biz_msg_db_keys: Vec::new(),
         verify_flags,
+        contact_extra,
     })
+}
+
+/// 读取一个 varint（LEB128），返回 `(值, 占用字节数)`。
+/// 越界或超过 10 字节（64 位 varint 上限）返回 `None`，不 panic。
+fn read_varint(buf: &[u8], start: usize) -> Option<(u64, usize)> {
+    let mut result: u64 = 0;
+    let mut i = start;
+    for shift in (0..64).step_by(7) {
+        let b = *buf.get(i)?;
+        result |= ((b & 0x7F) as u64) << shift;
+        i += 1;
+        if b & 0x80 == 0 {
+            return Some((result, i - start));
+        }
+    }
+    None
+}
+
+/// 解析 contact.extra_buffer protobuf BLOB，提取好友来源（顶层 varint field 8）
+/// 与添加时间（顶层 varint field 41，微信查看过资料页后才会写入，常缺失）。
+///
+/// 只扫描 top-level 字段，遇到未知 wire type 或数据截断时立即中止并返回已解析到的部分——
+/// 数据本身可能为 NULL / 空 / 格式不符，绝不 panic、绝不越界索引。
+fn parse_contact_extra(buf: &[u8]) -> (Option<i64>, Option<i64>) {
+    let mut source: Option<i64> = None;
+    let mut added_ts: Option<i64> = None;
+    let len = buf.len();
+    let mut i = 0usize;
+    while i < len {
+        let (tag, n) = match read_varint(buf, i) {
+            Some(v) => v,
+            None => break,
+        };
+        i += n;
+        let field_num = tag >> 3;
+        let wire_type = tag & 0x7;
+        match wire_type {
+            0 => {
+                // varint
+                let (val, n2) = match read_varint(buf, i) {
+                    Some(v) => v,
+                    None => break,
+                };
+                i += n2;
+                if field_num == 8 {
+                    source = Some(val as i64);
+                } else if field_num == 41 {
+                    added_ts = Some(val as i64);
+                }
+            }
+            1 => {
+                // 64-bit
+                if i + 8 > len {
+                    break;
+                }
+                i += 8;
+            }
+            2 => {
+                // length-delimited
+                let (l, n2) = match read_varint(buf, i) {
+                    Some(v) => v,
+                    None => break,
+                };
+                i += n2;
+                let l = l as usize;
+                if l > len || i > len - l {
+                    break;
+                }
+                i += l;
+            }
+            5 => {
+                // 32-bit
+                if i + 4 > len {
+                    break;
+                }
+                i += 4;
+            }
+            _ => break,
+        }
+    }
+    (source, added_ts)
+}
+
+/// 好友添加来源 code（extra_buffer field 8）-> 微信 UI 展示文案。
+/// 未知非零 code 仍会在 `wx contacts` 输出里带上原始 `source_code`，只是没有 `source` 文案。
+fn add_source_label(code: i64) -> Option<&'static str> {
+    match code {
+        1 => Some("通过QQ好友添加"),
+        3 => Some("通过搜索微信号添加"),
+        10 | 13 => Some("通过手机通讯录添加"),
+        14 => Some("通过群聊添加"),
+        15 => Some("通过搜索手机号添加"),
+        17 => Some("通过名片分享添加"),
+        18 => Some("通过附近的人添加"),
+        29 => Some("通过摇一摇添加"),
+        30 => Some("通过扫一扫添加"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod contact_extra_tests {
+    use super::*;
+
+    #[test]
+    fn parses_real_world_prefix_and_tail() {
+        // field2=1 (varint), field3=0 (varint), field4="AB" (len-delimited),
+        // field8=14 (varint, 来源=通过群聊添加)
+        let mut buf: Vec<u8> = vec![
+            0x10, 0x01, // field 2, varint, 1
+            0x18, 0x00, // field 3, varint, 0
+            0x22, 0x02, 0x41, 0x42, // field 4, len-delimited, "AB"
+            0x40, 0x0E, // field 8, varint, 14
+        ];
+        // field 41, varint, 1711020127 (tag bytes 0xC8 0x02)
+        buf.extend_from_slice(&[0xC8, 0x02, 0xDF, 0xB0, 0xF0, 0xAF, 0x06]);
+
+        assert_eq!(parse_contact_extra(&buf), (Some(14), Some(1711020127)));
+    }
+
+    #[test]
+    fn empty_input_returns_none_none() {
+        assert_eq!(parse_contact_extra(&[]), (None, None));
+    }
+
+    #[test]
+    fn truncated_varint_does_not_panic() {
+        // tag says field 8 varint, but the value byte is missing/truncated (continuation bit set)
+        let buf: Vec<u8> = vec![0x40, 0x80];
+        assert_eq!(parse_contact_extra(&buf), (None, None));
+
+        // tag itself truncated (continuation bit set, no following byte)
+        let buf2: Vec<u8> = vec![0x80];
+        assert_eq!(parse_contact_extra(&buf2), (None, None));
+
+        // length-delimited field claims a length longer than the remaining buffer
+        let buf3: Vec<u8> = vec![0x22, 0xFF, 0x01];
+        assert_eq!(parse_contact_extra(&buf3), (None, None));
+    }
 }
 
 /// 查询最近会话列表
@@ -1222,7 +1374,26 @@ pub async fn q_contacts(names: &Names, query: Option<&str>, limit: usize) -> Res
         .map
         .iter()
         .filter(|(u, _)| chat_type_of(u, names) == "private")
-        .map(|(u, d)| json!({ "username": u, "display": d }))
+        .map(|(u, d)| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("username".to_string(), json!(u));
+            obj.insert("display".to_string(), json!(d));
+            if let Some((source_code, added_ts)) = names.contact_extra.get(u) {
+                if let Some(code) = source_code.filter(|c| *c != 0) {
+                    obj.insert("source_code".to_string(), json!(code));
+                    if let Some(label) = add_source_label(code) {
+                        obj.insert("source".to_string(), json!(label));
+                    }
+                }
+                if let Some(ts) = added_ts.filter(|t| *t > 0) {
+                    obj.insert(
+                        "added_at".to_string(),
+                        json!(fmt_time(ts, "%Y-%m-%d %H:%M:%S")),
+                    );
+                }
+            }
+            Value::Object(obj)
+        })
         .collect();
 
     if let Some(q) = query {
@@ -4315,11 +4486,58 @@ pub async fn q_sns_notifications(
     Ok(json!({ "notifications": out, "total": total }))
 }
 
+/// 调试用：返回 SnsTimeLine 的原始行 (tid, user_name 列, content XML)。
+/// 不做任何解析，原文回吐，方便核对 likeUserList / commentUserList 等真实标签名。
+pub async fn q_sns_raw(db: &DbCache, tid: Option<i64>, limit: usize) -> Result<Value> {
+    let path = db.get("sns/sns.db").await?.context("无法解密 sns.db")?;
+    let limit = limit.clamp(1, 50);
+    let rows: Vec<(i64, String, String)> = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(&path)?;
+        let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match tid {
+            Some(t) => (
+                "SELECT tid, user_name, content FROM SnsTimeLine WHERE tid = ?",
+                vec![Box::new(t)],
+            ),
+            None => (
+                "SELECT tid, user_name, content FROM SnsTimeLine ORDER BY tid DESC LIMIT ?",
+                vec![Box::new(limit as i64)],
+            ),
+        };
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params_ref.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, String>(2).unwrap_or_default(),
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok::<_, anyhow::Error>(rows)
+    })
+    .await??;
+
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(|(tid, uname, content)| {
+            json!({
+                "tid": tid,
+                "user_name_column": uname,
+                "content": content,
+            })
+        })
+        .collect();
+    let total = out.len();
+    Ok(json!({ "rows": out, "total": total }))
+}
+
 // 朋友圈扫描的硬上限：单次查询最多解析这么多行 SnsTimeLine，
 // 防止用户传超大 limit 或者底层数据异常时把 daemon 卡住。
 // 当前账号 ~10k+ 帖子，5w 上限留足缓冲。
-const SNS_MAX_LIMIT: usize = 10_000;
-const SNS_MAX_SCAN: usize = 50_000;
+const SNS_MAX_LIMIT: usize = 50_000;
+const SNS_MAX_SCAN: usize = 200_000;
 
 /// 转义 SQL LIKE 模式中的元字符。配合 `ESCAPE '\\'` 使用。
 /// 反斜杠必须最先转义，否则后续替换出的 `\%` / `\_` 会被再次吞掉。
@@ -4442,6 +4660,56 @@ struct ParsedPost {
     content: String,
     media: Vec<Value>,
     location: String,
+    /// `<ContentObject>/<type>`：经验值 1=纯图文 / 3=音乐或外链分享 / 5=文章 / 15=视频号 等。
+    /// 不强加 enum，原样吐 int，下游按需 classify。
+    content_type: i64,
+    /// `<TimelineObject>/<private>`：0=公开，1=仅自己可见（私密）。
+    visibility_private: i64,
+    /// `<TimelineObject>/<showFlag>`：0=对所有朋友可见，非 0 = 部分可见 / 不给谁看。
+    /// 注意：具体 "给谁看 / 不给谁看" 的 wxid 名单 4.x schema 不存在 TimelineObject 里，
+    /// 推测在另一张表或仅 server 端持有 —— 这里只能反映 "是否受限"。
+    visibility_show_flag: i64,
+    /// `<TimelineObject>/<sightFolded>`：1 = 被微信折叠（一般是长视频）。
+    sight_folded: i64,
+    /// `<TimelineObject>/<contentDescScene>`：0/3/4 ... 与 contentDesc 的渲染场景相关，
+    /// 经验上 3 = 转发场景 / 4 = 视频号关联，0 = 普通。
+    content_desc_scene: i64,
+    /// 链接 / 音乐 / 文章帖标题（`<ContentObject>/<title>`）；纯图文帖通常为空。
+    link_title: String,
+    /// 链接帖跳转 URL（`<ContentObject>/<contentUrl>`）；公众号文章/Spotify/视频号外链都在这。
+    link_url: String,
+    likes: Vec<ParsedLike>,
+    comments: Vec<ParsedComment>,
+    /// `<like_user_list>` element 是否在 XML 中出现。
+    /// 元素缺失 → 当时这条帖没被打开过 detail view，名单不可知（不同于"零个赞"）。
+    likes_roster_present: bool,
+    /// `<comment_user_list>` element 是否在 XML 中出现。
+    comments_roster_present: bool,
+}
+
+/// 单条点赞。display name 在 post_to_value 里补。
+struct ParsedLike {
+    username: String,
+    /// 点赞时的昵称快照；可能和今天的 Names 显示名不一致（用户改过昵称 / 已删好友）。
+    nickname_snapshot: String,
+    create_time: i64,
+}
+
+/// 单条评论。image / emoji 评论的 url 列表也带回来，下游想离线渲染就能拿。
+struct ParsedComment {
+    username: String,
+    nickname_snapshot: String,
+    create_time: i64,
+    /// 纯文本评论内容；图片 / emoji 评论这里通常为空。
+    content: String,
+    /// 评论自己的 id；用作回复线程根。
+    comment_id: i64,
+    /// 被回复的 comment_id；0 表示一级评论。
+    ref_comment_id: i64,
+    /// 图片评论的 url 列表（`<imagelist>/<image>` 下的 url）。
+    images: Vec<String>,
+    /// 表情包评论的 md5 / url 列表。
+    emojis: Vec<String>,
 }
 
 fn parse_post_xml_fallback(tid: i64, user_name_column: &str, content: &str) -> ParsedPost {
@@ -4469,6 +4737,18 @@ fn parse_post_xml_fallback(tid: i64, user_name_column: &str, content: &str) -> P
         content: text,
         media: Vec::new(),
         location,
+        content_type: 0,
+        link_title: String::new(),
+        link_url: String::new(),
+        visibility_private: 0,
+        visibility_show_flag: 0,
+        sight_folded: 0,
+        content_desc_scene: 0,
+        likes: Vec::new(),
+        comments: Vec::new(),
+        // XML 解析失败时，名单 presence 无法判定 —— 当作未知（false）。
+        likes_roster_present: false,
+        comments_roster_present: false,
     }
 }
 
@@ -4505,6 +4785,49 @@ fn parse_post_xml(tid: i64, user_name_column: &str, content: &str) -> ParsedPost
         .map(str::to_string)
         .unwrap_or_default();
 
+    // ContentObject 是 TimelineObject 的子节点；link/music/article/视频号 帖的 title +
+    // 跳转 URL + 内容类型都在这里，纯图文帖只 type=1，title/contentUrl 为空。
+    let content_obj = xml_child(timeline, "ContentObject");
+    let content_type = content_obj
+        .and_then(|n| xml_text(xml_child(n, "type")))
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let link_title = content_obj
+        .and_then(|n| xml_text(xml_child(n, "title")))
+        .unwrap_or_default();
+    let link_url = content_obj
+        .and_then(|n| xml_text(xml_child(n, "contentUrl")))
+        .unwrap_or_default();
+
+    // 可见性 flag。private + showFlag 是 4.x TimelineObject 内仅有的两个范围控制字段。
+    // 用户列表（"给谁看 / 不给谁看"）不在这块 XML 里 —— 不要假装能解析到名单。
+    let visibility_private = xml_text(xml_child(timeline, "private"))
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let visibility_show_flag = xml_text(xml_child(timeline, "showFlag"))
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let sight_folded = xml_text(xml_child(timeline, "sightFolded"))
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let content_desc_scene = xml_text(xml_child(timeline, "contentDescScene"))
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    // like_user_list / comment_user_list 是 TimelineObject 的兄弟节点，
+    // 不在 ContentObject 下；用 doc.descendants() 是最稳的：转发帖 / 旧版本 schema
+    // 偶尔会把这两块挂在 SnsDataItem 别处。
+    let likes_node = doc
+        .descendants()
+        .find(|n| n.has_tag_name("like_user_list"));
+    let comments_node = doc
+        .descendants()
+        .find(|n| n.has_tag_name("comment_user_list"));
+    let likes_roster_present = likes_node.is_some();
+    let comments_roster_present = comments_node.is_some();
+    let likes = likes_node.map(parse_likes).unwrap_or_default();
+    let comments = comments_node.map(parse_comments).unwrap_or_default();
+
     ParsedPost {
         tid,
         create_time,
@@ -4512,7 +4835,82 @@ fn parse_post_xml(tid: i64, user_name_column: &str, content: &str) -> ParsedPost
         content: text,
         media,
         location,
+        content_type,
+        link_title,
+        link_url,
+        visibility_private,
+        visibility_show_flag,
+        sight_folded,
+        content_desc_scene,
+        likes,
+        comments,
+        likes_roster_present,
+        comments_roster_present,
     }
+}
+
+/// 从 `<like_user_list>` 节点抽出全部 `<user_comment type="1">`。
+fn parse_likes(list: Node) -> Vec<ParsedLike> {
+    list.children()
+        .filter(|n| n.is_element() && n.has_tag_name("user_comment"))
+        .map(|uc| ParsedLike {
+            username: xml_text(xml_child(uc, "username")).unwrap_or_default(),
+            nickname_snapshot: xml_text(xml_child(uc, "nickname")).unwrap_or_default(),
+            create_time: xml_text(xml_child(uc, "create_time"))
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0),
+        })
+        .collect()
+}
+
+/// 从 `<comment_user_list>` 节点抽出全部 `<user_comment type="2">`。
+/// 同时把 image / emoji 评论的 url 列表带回（`<imagelist>/<image>`、`<emojilist>/<emoji>`）。
+fn parse_comments(list: Node) -> Vec<ParsedComment> {
+    list.children()
+        .filter(|n| n.is_element() && n.has_tag_name("user_comment"))
+        .map(|uc| {
+            let images = xml_child(uc, "imagelist")
+                .map(|il| {
+                    il.children()
+                        .filter(|n| n.is_element() && n.has_tag_name("image"))
+                        .filter_map(|img| {
+                            // 图片评论里 url 偶尔是 text、偶尔是属性，两种都兜一下。
+                            xml_text(Some(img))
+                                .or_else(|| img.attribute("url").map(str::to_string))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let emojis = xml_child(uc, "emojilist")
+                .map(|el| {
+                    el.children()
+                        .filter(|n| n.is_element() && n.has_tag_name("emoji"))
+                        .filter_map(|emo| {
+                            emo.attribute("md5")
+                                .or_else(|| emo.attribute("url"))
+                                .map(str::to_string)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            ParsedComment {
+                username: xml_text(xml_child(uc, "username")).unwrap_or_default(),
+                nickname_snapshot: xml_text(xml_child(uc, "nickname")).unwrap_or_default(),
+                create_time: xml_text(xml_child(uc, "create_time"))
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0),
+                content: xml_text(xml_child(uc, "content")).unwrap_or_default(),
+                comment_id: xml_text(xml_child(uc, "comment_id"))
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0),
+                ref_comment_id: xml_text(xml_child(uc, "ref_comment_id"))
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0),
+                images,
+                emojis,
+            }
+        })
+        .collect()
 }
 
 fn post_to_value(p: ParsedPost, names: &Names) -> Value {
@@ -4521,6 +4919,49 @@ fn post_to_value(p: ParsedPost, names: &Names) -> Value {
     } else {
         names.display(&p.author_username)
     };
+    let likes: Vec<Value> = p
+        .likes
+        .into_iter()
+        .map(|l| {
+            let display = if l.username.is_empty() {
+                String::new()
+            } else {
+                names.display(&l.username)
+            };
+            json!({
+                "username": l.username,
+                "author": display,
+                "nickname_snapshot": l.nickname_snapshot,
+                "timestamp": l.create_time,
+                "time": fmt_time(l.create_time, "%Y-%m-%d %H:%M"),
+            })
+        })
+        .collect();
+    let likes_count = likes.len() as i64;
+    let comments: Vec<Value> = p
+        .comments
+        .into_iter()
+        .map(|c| {
+            let display = if c.username.is_empty() {
+                String::new()
+            } else {
+                names.display(&c.username)
+            };
+            json!({
+                "username": c.username,
+                "author": display,
+                "nickname_snapshot": c.nickname_snapshot,
+                "timestamp": c.create_time,
+                "time": fmt_time(c.create_time, "%Y-%m-%d %H:%M"),
+                "content": c.content,
+                "comment_id": c.comment_id,
+                "ref_comment_id": c.ref_comment_id,
+                "images": c.images,
+                "emojis": c.emojis,
+            })
+        })
+        .collect();
+    let comments_count = comments.len() as i64;
     json!({
         "tid": p.tid,
         "timestamp": p.create_time,
@@ -4531,6 +4972,19 @@ fn post_to_value(p: ParsedPost, names: &Names) -> Value {
         "media_count": p.media.len() as i64,
         "media": p.media,
         "location": p.location,
+        "content_type": p.content_type,
+        "link_title": p.link_title,
+        "link_url": p.link_url,
+        "visibility_private": p.visibility_private,
+        "visibility_show_flag": p.visibility_show_flag,
+        "sight_folded": p.sight_folded,
+        "content_desc_scene": p.content_desc_scene,
+        "likes_count": likes_count,
+        "likes": likes,
+        "likes_roster_present": p.likes_roster_present,
+        "comments_count": comments_count,
+        "comments": comments,
+        "comments_roster_present": p.comments_roster_present,
     })
 }
 
@@ -5726,6 +6180,72 @@ mod sns_tests {
         assert_eq!(p.content, "still here");
         assert_eq!(p.author_username, "wxid_outer");
         assert!(p.media.is_empty());
+    }
+
+    #[test]
+    fn parse_extracts_likes_and_comments_from_local_extra_info() {
+        // 真实 XML 中 like_user_list / comment_user_list 挂在 LocalExtraInfo 下，
+        // 不在 TimelineObject 内 —— descendants() 搜索保证两个位置都覆盖。
+        let xml = r#"<SnsDataItem>
+            <TimelineObject><createTime>1700000100</createTime><contentDesc>hi</contentDesc><username>wxid_a</username></TimelineObject>
+            <LocalExtraInfo>
+              <like_user_list>
+                <user_comment><username>wxid_l1</username><nickname>Liker One</nickname><create_time>1700000110</create_time><type>1</type></user_comment>
+                <user_comment><username>wxid_l2</username><nickname>Liker Two</nickname><create_time>1700000120</create_time><type>1</type></user_comment>
+              </like_user_list>
+              <comment_user_list>
+                <user_comment><comment_id>1</comment_id><ref_comment_id>0</ref_comment_id><username>wxid_c1</username><nickname>C One</nickname><content>nice</content><create_time>1700000130</create_time><type>2</type></user_comment>
+                <user_comment><comment_id>2</comment_id><ref_comment_id>1</ref_comment_id><username>wxid_c2</username><nickname>C Two</nickname><content>thanks</content><create_time>1700000140</create_time><type>2</type></user_comment>
+              </comment_user_list>
+            </LocalExtraInfo>
+        </SnsDataItem>"#;
+        let p = parse_post_xml(100, "wxid_a", xml);
+        assert!(p.likes_roster_present);
+        assert!(p.comments_roster_present);
+        assert_eq!(p.likes.len(), 2);
+        assert_eq!(p.likes[0].username, "wxid_l1");
+        assert_eq!(p.likes[0].nickname_snapshot, "Liker One");
+        assert_eq!(p.likes[0].create_time, 1700000110);
+        assert_eq!(p.comments.len(), 2);
+        assert_eq!(p.comments[1].ref_comment_id, 1);
+        assert_eq!(p.comments[1].content, "thanks");
+        assert_eq!(p.comments[0].comment_id, 1);
+    }
+
+    #[test]
+    fn parse_distinguishes_missing_roster_from_empty_roster() {
+        // 没有 like_user_list 节点 → 名单不可知；有空节点 → 名单可知且为零。
+        let xml_missing = "<TimelineObject><createTime>1700000200</createTime><contentDesc>x</contentDesc></TimelineObject>";
+        let p = parse_post_xml(101, "wxid_a", xml_missing);
+        assert!(!p.likes_roster_present);
+        assert!(p.likes.is_empty());
+
+        let xml_empty = r#"<SnsDataItem><TimelineObject><createTime>1700000201</createTime><contentDesc>y</contentDesc></TimelineObject><LocalExtraInfo><like_user_list/><comment_user_list/></LocalExtraInfo></SnsDataItem>"#;
+        let p = parse_post_xml(102, "wxid_a", xml_empty);
+        assert!(p.likes_roster_present);
+        assert!(p.comments_roster_present);
+        assert!(p.likes.is_empty());
+        assert!(p.comments.is_empty());
+    }
+
+    #[test]
+    fn parse_extracts_link_title_and_url_from_content_object() {
+        // 音乐分享 / 公众号文章 / Spotify 外链等帖：ContentObject.type != 1，
+        // 同时携带 title + contentUrl；纯图文帖这些字段为空。
+        let xml = r#"<TimelineObject>
+            <createTime>1700000300</createTime>
+            <contentDesc></contentDesc>
+            <ContentObject>
+              <title>Don't Look Back In Anger</title>
+              <contentUrl>https://open.spotify.com/track/xxx</contentUrl>
+              <type>3</type>
+              <mediaList><media><type>2</type></media></mediaList>
+            </ContentObject>
+        </TimelineObject>"#;
+        let p = parse_post_xml(103, "wxid_a", xml);
+        assert_eq!(p.content_type, 3);
+        assert_eq!(p.link_title, "Don't Look Back In Anger");
+        assert_eq!(p.link_url, "https://open.spotify.com/track/xxx");
     }
 
     #[test]
