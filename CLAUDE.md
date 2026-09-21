@@ -52,6 +52,14 @@ brew install mingw-w64   # 提供 x86_64-w64-mingw32-gcc，zstd-sys 等 C 依赖
 - [ ] `Cargo.toml` dependency section 顺序 → 检查是否有 dep 意外落入 target section
 - [ ] Windows named pipe 代码 → 确认函数都已定义，trait import 齐全
 
+## 用户自定义 function 的目录约定
+
+对每一个用户自定义的 function（例如 `foodie`、`moments-posts`）：
+
+- 先扫描当前项目根目录（`D:\gadget\wx-cli`），看是否已存在与该 function 同名的文件夹。
+- 如果没有，就为它新建一个同名文件夹。
+- 已存在则复用，不要重复创建。
+
 ## CI 结构
 
 ```

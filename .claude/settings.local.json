@@ -13,7 +13,8 @@
       "Bash(python3 wx.py sessions --help)",
       "Bash(python3 -c \"import sys; print\\(sys.executable\\)\")",
       "Bash(uv pip:*)",
-      "Bash(uv venv:*)"
+      "Bash(uv venv:*)",
+      "Bash(cargo test *)"
     ]
   }
 }

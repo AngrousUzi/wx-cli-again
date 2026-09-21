@@ -28,3 +28,9 @@ __pycache__/
 Thumbs.db
 find_all_keys_macos
 .claude/worktrees/
+
+
+# User-specific analysis archives
+/moments-posts
+/foodie
+/zodiac
