@@ -57,8 +57,8 @@ pub fn scan_keys_with_options(db_dir: &Path, opts: ScanOptions<'_>) -> Result<Ve
     return macos::scan_keys_with_options(db_dir, opts.hook_seconds, opts.auto_hook, opts.known);
     #[cfg(target_os = "linux")]
     {
-        let _ = opts;
-        return linux::scan_keys(db_dir);
+        let _ = (opts.hook_seconds, opts.auto_hook);
+        return linux::scan_keys_with_options(db_dir, opts.known);
     }
     #[cfg(target_os = "windows")]
     {
@@ -419,10 +419,151 @@ pub(crate) fn collect_salt_adjacent_keys(
     }
 }
 
+/// Linux WeChat (Radium 4.x) 使用的 32 字节循环异或掩码。
+/// WCDB 在堆上保存 `x'<64hex key><32hex salt>'` 字符串时，
+/// 会与该掩码按字节循环异或混淆。
+pub const LINUX_RADIUM_KEY_MASK: [u8; 32] = [
+    0xd2, 0xc7, 0x44, 0x24, 0x58, 0x02, 0x00, 0x00,
+    0x00, 0x48, 0x89, 0x44, 0x24, 0x50, 0x48, 0x8b,
+    0x45, 0x00, 0x48, 0x84, 0x4c, 0x24, 0x48, 0x48,
+    0x89, 0x44, 0x25, 0x40, 0x48, 0x58, 0x4c, 0x24,
+];
+
+/// 从内存缓冲区中扫描经 32-byte 掩码混淆的 `x'<64hex key><32hex salt>'` 字符串。
+pub(crate) fn scan_masked_radium_keys(
+    buf: &[u8],
+    mask: &[u8; 32],
+    results: &mut Vec<(String, String)>,
+    seen: &mut std::collections::HashSet<(String, String)>,
+) {
+    if buf.len() < 99 {
+        return;
+    }
+
+    let prefix = [b'x' ^ mask[0], b'\'' ^ mask[1]];
+    let expected_tail = b'\'' ^ mask[98 % 32];
+
+    let mut start = 0usize;
+    while start + 99 <= buf.len() {
+        if let Some(rel) = find_slice(&buf[start..], &prefix) {
+            let i = start + rel;
+            if i + 99 <= buf.len() && buf[i + 98] == expected_tail {
+                let mut unmasked = [0u8; 99];
+                for k in 0..99 {
+                    unmasked[k] = buf[i + k] ^ mask[k % 32];
+                }
+                if unmasked[0] == b'x'
+                    && unmasked[1] == b'\''
+                    && unmasked[98] == b'\''
+                    && unmasked[2..98].iter().all(|b| b.is_ascii_hexdigit())
+                {
+                    if let (Ok(key), Ok(salt)) = (
+                        std::str::from_utf8(&unmasked[2..66]),
+                        std::str::from_utf8(&unmasked[66..98]),
+                    ) {
+                        let pair = (key.to_ascii_lowercase(), salt.to_ascii_lowercase());
+                        if seen.insert(pair.clone()) {
+                            results.push(pair);
+                        }
+                    }
+                }
+            }
+            start = i + 1;
+        } else {
+            break;
+        }
+    }
+}
+
+/// 按已知的 DB salt 直接搜索掩码混淆后的 32 字节 salt 模式。
+/// 双重保障：即使前缀被截断或存在细微差异，只要 salt 掩码出现在内存中即可提取。
+pub(crate) fn collect_masked_salt_keys(
+    buf: &[u8],
+    masked_salts: &[([u8; 32], &str)],
+    mask: &[u8; 32],
+    results: &mut Vec<(String, String)>,
+    seen: &mut std::collections::HashSet<(String, String)>,
+) {
+    if buf.len() < 99 || masked_salts.is_empty() {
+        return;
+    }
+
+    for (m_salt, orig_salt_hex) in masked_salts {
+        let mut start = 0usize;
+        while start + 32 <= buf.len() {
+            if let Some(rel) = find_slice(&buf[start..], m_salt) {
+                let salt_idx = start + rel;
+                if salt_idx >= 66 && salt_idx + 33 <= buf.len() {
+                    let str_start = salt_idx - 66;
+                    let mut unmasked = [0u8; 99];
+                    for k in 0..99 {
+                        unmasked[k] = buf[str_start + k] ^ mask[k % 32];
+                    }
+                    if unmasked[0] == b'x'
+                        && unmasked[1] == b'\''
+                        && unmasked[98] == b'\''
+                        && unmasked[2..98].iter().all(|b| b.is_ascii_hexdigit())
+                    {
+                        if let (Ok(key), Ok(salt)) = (
+                            std::str::from_utf8(&unmasked[2..66]),
+                            std::str::from_utf8(&unmasked[66..98]),
+                        ) {
+                            if salt.eq_ignore_ascii_case(orig_salt_hex) {
+                                let pair = (key.to_ascii_lowercase(), salt.to_ascii_lowercase());
+                                if seen.insert(pair.clone()) {
+                                    results.push(pair);
+                                }
+                            }
+                        }
+                    }
+                }
+                start = salt_idx + 1;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 fn find_slice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let ptr = unsafe {
+            libc::memmem(
+                haystack.as_ptr() as *const libc::c_void,
+                haystack.len(),
+                needle.as_ptr() as *const libc::c_void,
+                needle.len(),
+            )
+        };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(ptr as usize - haystack.as_ptr() as usize)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let first = needle[0];
+        let mut offset = 0;
+        while let Some(idx) = haystack[offset..].iter().position(|&b| b == first) {
+            let actual = offset + idx;
+            if actual + needle.len() > haystack.len() {
+                return None;
+            }
+            if &haystack[actual..actual + needle.len()] == needle {
+                return Some(actual);
+            }
+            offset = actual + 1;
+        }
+        None
+    }
 }
 
 fn push_raw_key(
@@ -769,4 +910,43 @@ mod tests {
         let expect = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
         assert!(out.iter().any(|h| h == &expect), "got {out:?}");
     }
+
+    #[test]
+    fn scan_masked_radium_keys_finds_xor_xhex() {
+        let key = "1234567890abcdef".repeat(4);
+        let salt = "fedcba0987654321".repeat(2);
+        let plain = format!("x'{key}{salt}'").into_bytes();
+        assert_eq!(plain.len(), 99);
+
+        let mut masked = vec![0u8; 99];
+        for (i, b) in plain.iter().enumerate() {
+            masked[i] = b ^ LINUX_RADIUM_KEY_MASK[i % 32];
+        }
+
+        let mut buf = b"noise_before_padded".to_vec();
+        buf.extend_from_slice(&masked);
+        buf.extend_from_slice(b"noise_after_padded");
+
+        let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        scan_masked_radium_keys(&buf, &LINUX_RADIUM_KEY_MASK, &mut results, &mut seen);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, key);
+        assert_eq!(results[0].1, salt);
+
+        // 测试 collect_masked_salt_keys 双重保障
+        let salt_bytes = salt.as_bytes();
+        let mut m_salt = [0u8; 32];
+        for k in 0..32 {
+            m_salt[k] = salt_bytes[k] ^ LINUX_RADIUM_KEY_MASK[(66 + k) % 32];
+        }
+        let masked_salts = vec![(m_salt, salt.as_str())];
+        let mut results2 = Vec::new();
+        let mut seen2 = std::collections::HashSet::new();
+        collect_masked_salt_keys(&buf, &masked_salts, &LINUX_RADIUM_KEY_MASK, &mut results2, &mut seen2);
+        assert_eq!(results2.len(), 1);
+        assert_eq!(results2[0].0, key);
+        assert_eq!(results2[0].1, salt);
+    }
 }
+

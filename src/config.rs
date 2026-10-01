@@ -213,9 +213,12 @@ fn default_db_dir() -> PathBuf {
     }
     #[cfg(target_os = "linux")]
     {
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join("Documents/xwechat_files")
+        let home = dirs::home_dir().unwrap_or_default();
+        if home.join("文档/xwechat_files").exists() {
+            home.join("文档/xwechat_files")
+        } else {
+            home.join("Documents/xwechat_files")
+        }
     }
     #[cfg(target_os = "windows")]
     {
@@ -281,13 +284,15 @@ fn detect_db_dir_impl() -> Option<PathBuf> {
 
     let mut candidates: Vec<PathBuf> = Vec::new();
     for base_home in [Some(home.clone()), sudo_home].into_iter().flatten() {
-        let xwechat = base_home.join("Documents/xwechat_files");
-        if xwechat.exists() {
-            if let Ok(entries) = std::fs::read_dir(&xwechat) {
-                for entry in entries.flatten() {
-                    let storage = entry.path().join("db_storage");
-                    if storage.is_dir() {
-                        candidates.push(storage);
+        for rel in &["Documents/xwechat_files", "文档/xwechat_files"] {
+            let xwechat = base_home.join(rel);
+            if xwechat.exists() {
+                if let Ok(entries) = std::fs::read_dir(&xwechat) {
+                    for entry in entries.flatten() {
+                        let storage = entry.path().join("db_storage");
+                        if storage.is_dir() {
+                            candidates.push(storage);
+                        }
                     }
                 }
             }

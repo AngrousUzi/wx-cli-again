@@ -53,11 +53,20 @@ pub fn cmd_doctor(json: bool, fix: bool) -> Result<()> {
         if all_ok {
             println!("\n全部检查通过。");
         } else {
+            #[cfg(target_os = "macos")]
             println!(
                 "\n存在未通过项。补密钥：{}\n\
                  （本机 GUI Terminal + 等待时打开相关聊天；SIP 无需关闭）",
                 config::RECOMMENDED_KEY_EXTRACT
             );
+            #[cfg(target_os = "linux")]
+            println!(
+                "\n存在未通过项。补密钥：{}\n\
+                 （需要 sudo 权限以读取进程内存）",
+                config::RECOMMENDED_KEY_EXTRACT
+            );
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            println!("\n存在未通过项。补密钥：{}", config::RECOMMENDED_KEY_EXTRACT);
         }
     }
     Ok(())
@@ -147,6 +156,38 @@ fn run_checks() -> Vec<Check> {
                 "未找到".into()
             },
             fix: Some("xcode-select --install".into()),
+        });
+    }
+
+    // Linux Yama ptrace_scope
+    #[cfg(target_os = "linux")]
+    {
+        let scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+            .ok()
+            .map(|s| s.trim().to_string());
+        let scope_val = scope.as_deref().unwrap_or("未知");
+        let is_root = unsafe { libc::geteuid() } == 0;
+        let has_keys = config::load_config()
+            .map(|c| c.keys_file.exists())
+            .unwrap_or(false);
+        out.push(Check {
+            name: "Yama ptrace_scope".into(),
+            ok: scope_val == "0" || is_root || has_keys,
+            detail: format!(
+                "scope={scope_val}{}",
+                if is_root {
+                    " (root)"
+                } else if has_keys {
+                    "（已配齐密钥，日常无需 ptrace）"
+                } else {
+                    ""
+                }
+            ),
+            fix: if scope_val != "0" && !is_root && !has_keys {
+                Some("内存扫描需要 root 权限，请使用 sudo wx init（或临时设置 sysctl kernel.yama.ptrace_scope=0）".into())
+            } else {
+                None
+            },
         });
     }
 
@@ -339,16 +380,64 @@ fn format_missing_preview(items: &[scanner::MissingDb], max: usize) -> String {
 }
 
 fn find_wechat_pid() -> Option<u32> {
-    let out = Command::new("pgrep").args(["-x", "WeChat"]).output().ok()?;
-    if !out.status.success() {
-        return None;
+    #[cfg(target_os = "linux")]
+    {
+        // Linux 进程名通常为 wechat 或 weixin
+        if let Ok(out) = Command::new("pgrep").args(["-i", "-x", "wechat"]).output() {
+            if out.status.success() {
+                if let Some(pid) = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .next()
+                    .and_then(|l| l.trim().parse().ok())
+                {
+                    return Some(pid);
+                }
+            }
+        }
+        if let Ok(out) = Command::new("pgrep").args(["-i", "-x", "weixin"]).output() {
+            if out.status.success() {
+                if let Some(pid) = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .next()
+                    .and_then(|l| l.trim().parse().ok())
+                {
+                    return Some(pid);
+                }
+            }
+        }
+        None
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+    #[cfg(target_os = "windows")]
+    {
+        let out = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout);
+        for line in s.lines() {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 2 {
+                let pid_str = parts[1].trim_matches('"').trim();
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    return Some(pid);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let out = Command::new("pgrep").args(["-x", "WeChat"]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    }
 }
 
 fn read_key_for(keys_path: &Path, rel: &str) -> Option<String> {

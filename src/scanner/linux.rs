@@ -8,8 +8,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::{
-    collect_db_salts, collect_salt_adjacent_keys, decode_salt_hex, match_key_hexes,
-    scan_key_patterns, unique_key_hexes, KeyEntry, MAX_PATTERN_BYTES,
+    collect_db_salts, collect_masked_salt_keys, collect_salt_adjacent_keys, decode_salt_hex,
+    match_key_hexes, scan_key_patterns, scan_masked_radium_keys, unique_key_hexes, KeyEntry,
+    LINUX_RADIUM_KEY_MASK, MAX_PATTERN_BYTES,
 };
 
 const CHUNK_SIZE: usize = 2 * 1024 * 1024;
@@ -63,25 +64,62 @@ fn parse_maps(pid: u32) -> Result<Vec<(u64, u64)>> {
             u64::from_str_radix(addr_parts[0], 16),
             u64::from_str_radix(addr_parts[1], 16),
         ) {
-            regions.push((start, end));
+            let size = end.saturating_sub(start);
+            // 忽略 0 字节和超过 512MB 的超大映射（与 macOS 一致，防止扫描巨型虚拟内存区）
+            if size > 0 && size < 512 * 1024 * 1024 {
+                regions.push((start, end));
+            }
         }
     }
     Ok(regions)
 }
 
+#[allow(dead_code)]
 pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
+    scan_keys_with_options(db_dir, &[])
+}
+
+pub fn scan_keys_with_options(db_dir: &Path, known: &[KeyEntry]) -> Result<Vec<KeyEntry>> {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if !is_root {
+        bail!(
+            "读取 WeChat 进程内存需要 root 权限（受 Linux Yama ptrace_scope 限制）。\n\
+             请使用 sudo 重新运行：\n\
+             \n\
+                 sudo wx init\n\
+             \n\
+             （或 sudo wx key extract）\n\
+             初始化完成后，配置文件和密钥会自动归属当前用户，日常使用无需 sudo。"
+        );
+    }
+
     let pid = find_wechat_pid().context("找不到 WeChat 进程，请确认 WeChat 正在运行")?;
     eprintln!("WeChat PID: {}", pid);
 
     let db_salts = collect_db_salts(db_dir);
     eprintln!("找到 {} 个加密数据库", db_salts.len());
 
-    // salt 字节用于「salt 邻接」二进制 key 扫描：新版 Linux 微信（Radium 4.x）
-    // 不再把 key 以 ASCII `x'<hex>'` 形式留在内存，只能按 DB salt 在堆上找邻接的
-    // 32-byte raw key。与 macOS 扫描器同源（collect_salt_adjacent_keys）。
+    // salt 字节用于「salt 邻接」二进制 key 扫描
     let salt_bytes: Vec<[u8; 16]> = db_salts
         .iter()
         .filter_map(|(s, _)| decode_salt_hex(s))
+        .collect();
+
+    // 预计算已知 DB 的混淆 salt 模式（Linux 微信 4.x / Radium 掩码搜索）
+    let masked_salts: Vec<([u8; 32], &str)> = db_salts
+        .iter()
+        .filter_map(|(s, _)| {
+            if s.len() == 32 {
+                let b = s.as_bytes();
+                let mut m = [0u8; 32];
+                for k in 0..32 {
+                    m[k] = b[k] ^ LINUX_RADIUM_KEY_MASK[(66 + k) % 32];
+                }
+                Some((m, s.as_str()))
+            } else {
+                None
+            }
+        })
         .collect();
 
     eprintln!("扫描进程内存...");
@@ -93,6 +131,8 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
         .with_context(|| format!("打开 {} 失败，请以 root 权限运行", mem_path))?;
 
     let mut raw_keys: Vec<(String, String)> = Vec::new();
+    let mut seen_masked: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     let mut extra_keys: Vec<String> = Vec::new();
     let mut seen_extra: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (start, end) in &regions {
@@ -101,13 +141,15 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
             *start,
             *end,
             &salt_bytes,
+            &masked_salts,
             &mut raw_keys,
+            &mut seen_masked,
             &mut extra_keys,
             &mut seen_extra,
         );
     }
     eprintln!(
-        "候选密钥：x'hex' {} 个，salt 邻接 {} 个",
+        "候选密钥：x'hex'（含混淆）{} 个，salt 邻接 {} 个",
         raw_keys.len(),
         extra_keys.len()
     );
@@ -120,14 +162,27 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
         }
     }
 
-    let entries = if raw_keys.is_empty() && all_key_hexes.is_empty() {
+    let mut entries = if raw_keys.is_empty() && all_key_hexes.is_empty() {
         Vec::new()
     } else {
         match_key_hexes(db_dir, &all_key_hexes, &raw_keys, &db_salts)
     };
 
+    // 把已有有效密钥并入，避免已配齐时还漏掉冷分片
+    if !known.is_empty() {
+        let mut by_name: std::collections::BTreeMap<String, KeyEntry> = known
+            .iter()
+            .cloned()
+            .map(|e| (e.db_name.clone(), e))
+            .collect();
+        for e in entries {
+            by_name.insert(e.db_name.clone(), e);
+        }
+        entries = by_name.into_values().collect();
+    }
+
     eprintln!(
-        "匹配到 {}/{} 个数据库密钥（来自 {} 个候选 key）",
+        "匹配到 {}/{} 个数据库密钥（来自 {} 个候选 key，含已有密钥）",
         entries.len(),
         db_salts.len(),
         all_key_hexes.len()
@@ -141,7 +196,9 @@ fn scan_region(
     start: u64,
     end: u64,
     salts: &[[u8; 16]],
+    masked_salts: &[([u8; 32], &str)],
     results: &mut Vec<(String, String)>,
+    seen_masked: &mut std::collections::HashSet<(String, String)>,
     extra_keys: &mut Vec<String>,
     seen_extra: &mut std::collections::HashSet<String>,
 ) {
@@ -163,7 +220,18 @@ fn scan_region(
         match mem.read(&mut buf) {
             Ok(n) if n > 0 => {
                 buf.truncate(n);
+                // 1) 传统明文 ASCII 模式 `x'<key><salt>'`
                 search_pattern(&buf, results);
+                // 2) Linux 微信 4.x (Radium / WCDB) 掩码混淆 key 模式
+                scan_masked_radium_keys(&buf, &LINUX_RADIUM_KEY_MASK, results, seen_masked);
+                collect_masked_salt_keys(
+                    &buf,
+                    masked_salts,
+                    &LINUX_RADIUM_KEY_MASK,
+                    results,
+                    seen_masked,
+                );
+                // 3) salt 邻接 raw binary key 模式
                 collect_salt_adjacent_keys(&buf, salts, extra_keys, seen_extra);
             }
             _ => {}
@@ -180,3 +248,4 @@ fn scan_region(
 fn search_pattern(buf: &[u8], results: &mut Vec<(String, String)>) {
     scan_key_patterns(buf, results);
 }
+

@@ -57,7 +57,13 @@ impl ImageKeyProvider for MacosImageKeyProvider {
 }
 
 fn derive_key_for_paths(db_dir: &Path, attach_dir: &Path) -> Result<ImageKeyMaterial> {
-    let templates = find_v2_template_ciphertexts(attach_dir, 3, 64)?;
+    let mut templates = find_v2_template_ciphertexts(attach_dir, 3, 64)?;
+    if templates.is_empty() {
+        if let Some(base) = db_dir.parent() {
+            let cache_dir = base.join("cache");
+            templates = find_v2_template_ciphertexts(&cache_dir, 3, 64)?;
+        }
+    }
     if templates.is_empty() {
         bail!("在 {} 下找不到 V2 模板文件", attach_dir.display());
     }
@@ -69,6 +75,11 @@ fn derive_key_for_paths(db_dir: &Path, attach_dir: &Path) -> Result<ImageKeyMate
     let (wxid_full, wxid_norm, suffix) =
         extract_wxid_parts(db_dir).context("db_dir 不含可用于 fallback 的 wxid 4 位后缀")?;
     let (xor_key, _votes, _total) = derive_xor_key_from_v2_dat(attach_dir, 10, 3)?
+        .or_else(|| {
+            db_dir.parent().and_then(|base| {
+                derive_xor_key_from_v2_dat(&base.join("cache"), 10, 3).ok().flatten()
+            })
+        })
         .context("V2 .dat 样本不足，无法投票反推 xor_key")?;
 
     for wxid in preferred_wxid_candidates(&wxid_full, &wxid_norm) {
@@ -77,7 +88,7 @@ fn derive_key_for_paths(db_dir: &Path, attach_dir: &Path) -> Result<ImageKeyMate
         }
     }
 
-    bail!("macOS V2 图片 key 派生失败")
+    bail!("V2 图片 key 派生失败")
 }
 
 fn find_via_kvcomm(db_dir: &Path, templates: &[[u8; 16]]) -> Result<Option<ImageKeyMaterial>> {
@@ -169,6 +180,8 @@ fn derive_kvcomm_dir_candidates(db_dir: &Path) -> Vec<PathBuf> {
         candidates.push(
             home.join("Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/net/kvcomm"),
         );
+        candidates.push(home.join(".xwechat/net/kvcomm"));
+        candidates.push(home.join(".xwechat/radium"));
     }
 
     let mut dedup = Vec::new();

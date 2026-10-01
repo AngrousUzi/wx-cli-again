@@ -1,11 +1,5 @@
-use anyhow::{bail, Result};
+//! Linux V2 image AES key 提取。
+//! 与 macOS 同理，从 ~/.xwechat/net/kvcomm/ 下的 `key_<uin>_*.statistic` 文件名拿 uin，
+//! 然后通过 `md5(str(uin) + wxid)[:16]` 派生 AES key，XOR key 为 `uin & 0xff`。
 
-use super::{ImageKeyMaterial, ImageKeyProvider};
-
-pub struct LinuxImageKeyProvider;
-
-impl ImageKeyProvider for LinuxImageKeyProvider {
-    fn get_key(&self, _wxid: &str) -> Result<ImageKeyMaterial> {
-        bail!("Linux V2 图片 key 当前未实现；请先用 legacy/V1 图片或在 README 中标注 unsupported")
-    }
-}
+pub type LinuxImageKeyProvider = super::macos::MacosImageKeyProvider;

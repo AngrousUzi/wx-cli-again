@@ -201,6 +201,16 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        println!();
+        println!("[Linux] 说明：");
+        println!("  · 受 Yama ptrace_scope 限制，抓取内存密钥需要 sudo 权限。");
+        println!(
+            "  · 初始化完成后配置与密钥已还原为当前用户属主，后续日常命令及后台守护进程均无需 sudo。"
+        );
+    }
+
     Ok(())
 }
 

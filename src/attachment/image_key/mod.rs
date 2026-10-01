@@ -9,7 +9,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod linux;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -59,7 +59,7 @@ pub fn default_provider() -> Option<Box<dyn ImageKeyProvider + Send + Sync>> {
     }
     #[cfg(target_os = "linux")]
     {
-        return Some(Box::new(linux::LinuxImageKeyProvider));
+        return Some(Box::new(linux::LinuxImageKeyProvider::from_current_config()));
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
