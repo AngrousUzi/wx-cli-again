@@ -8,7 +8,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::{
-    collect_db_salts, match_raw_keys, scan_key_patterns, KeyEntry, MAX_PATTERN_BYTES,
+    collect_db_salts, collect_salt_adjacent_keys, decode_salt_hex, match_key_hexes,
+    scan_key_patterns, unique_key_hexes, KeyEntry, MAX_PATTERN_BYTES,
 };
 
 const CHUNK_SIZE: usize = 2 * 1024 * 1024;
@@ -75,6 +76,14 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     let db_salts = collect_db_salts(db_dir);
     eprintln!("找到 {} 个加密数据库", db_salts.len());
 
+    // salt 字节用于「salt 邻接」二进制 key 扫描：新版 Linux 微信（Radium 4.x）
+    // 不再把 key 以 ASCII `x'<hex>'` 形式留在内存，只能按 DB salt 在堆上找邻接的
+    // 32-byte raw key。与 macOS 扫描器同源（collect_salt_adjacent_keys）。
+    let salt_bytes: Vec<[u8; 16]> = db_salts
+        .iter()
+        .filter_map(|(s, _)| decode_salt_hex(s))
+        .collect();
+
     eprintln!("扫描进程内存...");
     let regions = parse_maps(pid)?;
     eprintln!("找到 {} 个可读写内存区域", regions.len());
@@ -84,23 +93,58 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
         .with_context(|| format!("打开 {} 失败，请以 root 权限运行", mem_path))?;
 
     let mut raw_keys: Vec<(String, String)> = Vec::new();
+    let mut extra_keys: Vec<String> = Vec::new();
+    let mut seen_extra: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (start, end) in &regions {
-        scan_region(&mut mem_file, *start, *end, &mut raw_keys);
+        scan_region(
+            &mut mem_file,
+            *start,
+            *end,
+            &salt_bytes,
+            &mut raw_keys,
+            &mut extra_keys,
+            &mut seen_extra,
+        );
     }
-    eprintln!("找到 {} 个候选密钥", raw_keys.len());
+    eprintln!(
+        "候选密钥：x'hex' {} 个，salt 邻接 {} 个",
+        raw_keys.len(),
+        extra_keys.len()
+    );
 
-    let entries = match_raw_keys(db_dir, &raw_keys, &db_salts);
+    // 合并两类候选，统一用数据库第一页 HMAC/解密验证（match_key_hexes）。
+    let mut all_key_hexes = unique_key_hexes(&raw_keys);
+    for k in &extra_keys {
+        if !all_key_hexes.iter().any(|x| x == k) {
+            all_key_hexes.push(k.clone());
+        }
+    }
+
+    let entries = if raw_keys.is_empty() && all_key_hexes.is_empty() {
+        Vec::new()
+    } else {
+        match_key_hexes(db_dir, &all_key_hexes, &raw_keys, &db_salts)
+    };
 
     eprintln!(
         "匹配到 {}/{} 个数据库密钥（来自 {} 个候选 key）",
         entries.len(),
         db_salts.len(),
-        raw_keys.len()
+        all_key_hexes.len()
     );
     Ok(entries)
 }
 
-fn scan_region(mem: &mut std::fs::File, start: u64, end: u64, results: &mut Vec<(String, String)>) {
+#[allow(clippy::too_many_arguments)]
+fn scan_region(
+    mem: &mut std::fs::File,
+    start: u64,
+    end: u64,
+    salts: &[[u8; 16]],
+    results: &mut Vec<(String, String)>,
+    extra_keys: &mut Vec<String>,
+    seen_extra: &mut std::collections::HashSet<String>,
+) {
     let total_len = (end - start) as usize;
     let overlap = MAX_PATTERN_BYTES;
     let mut offset = 0usize;
@@ -120,6 +164,7 @@ fn scan_region(mem: &mut std::fs::File, start: u64, end: u64, results: &mut Vec<
             Ok(n) if n > 0 => {
                 buf.truncate(n);
                 search_pattern(&buf, results);
+                collect_salt_adjacent_keys(&buf, salts, extra_keys, seen_extra);
             }
             _ => {}
         }
