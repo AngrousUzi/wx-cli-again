@@ -1,0 +1,14 @@
+[Unit]
+Description=wx-cli RSS bridge (WeChat articles to Obsidian feeds)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/wx-cli/rss-bridge
+ExecStart=/usr/bin/env python3 bridge.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
