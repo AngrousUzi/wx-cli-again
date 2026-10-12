@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=wechat
+Name[zh_CN]=微信
+Exec=/usr/bin/wechat
+Icon=/usr/share/icons/hicolor/512x512/apps/wechat.png
+Terminal=false
+StartupNotify=true
+Comment=Autostart WeChat so wx biz-articles keeps receiving new articles
+X-GNOME-Autostart-enabled=true

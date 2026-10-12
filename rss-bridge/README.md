@@ -103,3 +103,28 @@ auth-off service).
   pushed in between. Harmless; the next refresh starts over.
 - **Nothing happens on refresh**: check the log for `subscribed to feed events`.
   Only one connection per source is kept; a second bridge replaces the first.
+
+## Keeping WeChat itself alive across reboots (Linux host)
+
+The bridge survives a reboot (systemd user unit + linger), but new articles only
+arrive while the WeChat client is running and logged in. On the Ubuntu 24.04 /
+GNOME host the deb has no autostart setting, and after launch it still waits on
+the 进入微信 button even with auto-login approved on the phone. `autostart/`
+holds the pieces that close that gap:
+
+- `wechat.desktop` → `~/.config/autostart/`: launches WeChat with the session
+  (GDM auto-login is already on for the user).
+- `wx-login-tap.desktop` → `~/.config/autostart/`: 10 s later runs
+  `~/.local/bin/wx-login-tap.py --max-wait 240`.
+- `wx-login-tap.py` → `~/.local/bin/`: screenshots every 3 s (gnome-screenshot),
+  waits for button green at (150, 320), then steers a virtual relative mouse
+  (uinput, via passwordless `sudo -n`) onto the button center (205, 327) in a
+  closed loop (cursor found by diffing screenshots with/without pointer) and
+  clicks. Needs `python3-evdev`, `python3-pil`, `gnome-screenshot`.
+
+Why a mouse and a closed loop: mutter on this session drops uinput touchscreens
+and keyboards (libinput sees them, the shell never reacts) and only relative
+mice get through, with pointer acceleration applied. Verified 2026-10-11: quit +
+relaunch logs in with one click. The probe/target assume the 1920x1080 panel
+and the login window in the top-left corner; pass `--probe X Y --target X Y`
+otherwise. It does nothing while the screen is locked.

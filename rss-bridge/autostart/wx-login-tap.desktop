@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=wx-login-tap
+Exec=/usr/bin/python3 /home/xxxxxxyz/.local/bin/wx-login-tap.py --max-wait 240
+Terminal=false
+NoDisplay=true
+Comment=Press WeChat's 进入微信 button after autostart (polls the screen for up to 4 minutes)
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=10
