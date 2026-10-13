@@ -1,11 +1,12 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config;
-use crate::ipc::{Request, Response};
+use crate::ipc::{ExeStamp, Request, Response};
 
 const STARTUP_TIMEOUT_SECS: u64 = 15;
 #[cfg(unix)]
@@ -18,30 +19,84 @@ struct PidFile {
     exe: Option<PathBuf>,
 }
 
-/// 检查 daemon 是否存活
-pub fn is_alive() -> bool {
+/// Ping daemon，存活时返回 pong 数据（pid / version / exe 指纹，旧版 daemon 只有 pong）
+pub fn ping() -> Option<Value> {
     #[cfg(unix)]
     {
-        ping_unix().unwrap_or(false)
+        ping_unix().ok().flatten()
     }
     #[cfg(windows)]
     {
-        ping_windows().unwrap_or(false)
+        ping_windows().ok().flatten()
     }
     #[cfg(not(any(unix, windows)))]
     {
-        false
+        None
     }
 }
 
-/// 确保 daemon 运行，必要时自动启动
-pub fn ensure_daemon() -> Result<()> {
-    if is_alive() {
-        return Ok(());
+/// 检查 daemon 是否存活
+pub fn is_alive() -> bool {
+    ping().is_some()
+}
+
+/// daemon 是否在跑旧二进制：Ping 回传的启动时指纹与磁盘上同一路径的现状不符。
+/// 返回的原因接在 "wx-daemon " 后面读。
+pub fn stale_reason(pong: &Value) -> Option<String> {
+    let started = match pong.get("exe") {
+        None => return Some("是旧版本（Ping 不回传二进制指纹）".into()),
+        // null（daemon 取不到自身路径）或无法解析：不判断，免得每次都重启
+        Some(v) => serde_json::from_value::<ExeStamp>(v.clone()).ok()?,
+    };
+    match ExeStamp::of(&started.path) {
+        Some(now) if now == started => None,
+        Some(_) => Some(format!("的二进制 {} 已被替换", started.path.display())),
+        None => Some(format!("的二进制 {} 已不存在", started.path.display())),
     }
+}
+
+/// 确保 daemon 运行，必要时自动启动；daemon 跑的二进制已被替换时重启它
+pub fn ensure_daemon() -> Result<()> {
+    let exe = match ping() {
+        None => self_exe()?,
+        Some(pong) => {
+            let Some(reason) = stale_reason(&pong) else {
+                return Ok(());
+            };
+            eprintln!("wx-daemon {}，重启...", reason);
+            if let Err(e) = stop_daemon() {
+                eprintln!("无法停止旧 daemon，继续使用它: {:#}", e);
+                return Ok(());
+            }
+            // 并发的另一个 CLI 可能已经拉起了新 daemon
+            if ping().is_some_and(|p| stale_reason(&p).is_none()) {
+                return Ok(());
+            }
+            // 从 daemon 原来的路径重启（那里现在是新二进制），路径不在了才用自身
+            match pong
+                .pointer("/exe/path")
+                .and_then(|p| p.as_str())
+                .map(PathBuf::from)
+            {
+                Some(path) if path.is_file() => path,
+                _ => self_exe()?,
+            }
+        }
+    };
     eprintln!("启动 wx-daemon...");
-    start_daemon()?;
+    start_daemon(&exe)?;
     Ok(())
+}
+
+/// 当前进程的二进制路径。Linux 上若文件已被替换（重新编译 / 安装），
+/// current_exe() 带 " (deleted)" 后缀，此时取同一路径上的新文件。
+fn self_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("无法获取当前可执行文件路径")?;
+    #[cfg(target_os = "linux")]
+    if let Some(live) = exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        return Ok(PathBuf::from(live));
+    }
+    Ok(exe)
 }
 
 /// 停止 daemon（如果正在运行）
@@ -110,9 +165,8 @@ fn preflight_cli_dir_writable() -> Result<()> {
     }
 }
 
-/// 启动 daemon 进程（自身二进制，设置 WX_DAEMON_MODE=1）
-fn start_daemon() -> Result<()> {
-    let exe = std::env::current_exe().context("无法获取当前可执行文件路径")?;
+/// 启动 daemon 进程（wx 二进制 `exe`，设置 WX_DAEMON_MODE=1）
+fn start_daemon(exe: &Path) -> Result<()> {
     let child_pid: u32;
 
     // 预检：当前用户是否能写 ~/.wx-cli/。如果不能，给出可操作的错误信息，
@@ -135,7 +189,7 @@ fn start_daemon() -> Result<()> {
             .and_then(|f| f.try_clone().map(|g| (f, g)))
             .map(|(f, g)| (std::process::Stdio::from(f), std::process::Stdio::from(g)))
             .unwrap_or_else(|_| (std::process::Stdio::null(), std::process::Stdio::null()));
-        let mut cmd = std::process::Command::new(&exe);
+        let mut cmd = std::process::Command::new(exe);
         cmd.env("WX_DAEMON_MODE", "1")
             .stdin(std::process::Stdio::null())
             .stdout(stdout_stdio)
@@ -165,7 +219,7 @@ fn start_daemon() -> Result<()> {
             .and_then(|f| f.try_clone().map(|g| (f, g)))
             .map(|(f, g)| (std::process::Stdio::from(f), std::process::Stdio::from(g)))
             .unwrap_or_else(|_| (std::process::Stdio::null(), std::process::Stdio::null()));
-        let child = std::process::Command::new(&exe)
+        let child = std::process::Command::new(exe)
             .env("WX_DAEMON_MODE", "1")
             .stdin(std::process::Stdio::null())
             .stdout(stdout_stdio)
@@ -181,7 +235,7 @@ fn start_daemon() -> Result<()> {
     while std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(300));
         if is_alive() {
-            write_pid_file(child_pid, &exe)?;
+            write_pid_file(child_pid, exe)?;
             return Ok(());
         }
     }
@@ -231,12 +285,16 @@ fn cleanup_ipc_files() {
     let _ = std::fs::remove_file(config::pid_path());
 }
 
+fn pong_data(resp: Response) -> Option<Value> {
+    (resp.ok && resp.data.get("pong").and_then(|p| p.as_bool()) == Some(true)).then_some(resp.data)
+}
+
 #[cfg(unix)]
-fn ping_unix() -> Result<bool> {
+fn ping_unix() -> Result<Option<Value>> {
     use std::os::unix::net::UnixStream;
     let sock_path = config::sock_path();
     if !sock_path.exists() {
-        return Ok(false);
+        return Ok(None);
     }
     let mut stream = UnixStream::connect(&sock_path)?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
@@ -250,11 +308,11 @@ fn ping_unix() -> Result<bool> {
     reader.read_line(&mut line)?;
 
     let resp: Response = serde_json::from_str(&line)?;
-    Ok(resp.ok && resp.data.get("pong").and_then(|p| p.as_bool()) == Some(true))
+    Ok(pong_data(resp))
 }
 
 #[cfg(windows)]
-fn ping_windows() -> Result<bool> {
+fn ping_windows() -> Result<Option<Value>> {
     use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream};
 
     let name = "wx-cli-daemon".to_ns_name::<GenericNamespaced>()?;
@@ -268,7 +326,7 @@ fn ping_windows() -> Result<bool> {
     reader.read_line(&mut line)?;
 
     let resp: Response = serde_json::from_str(&line)?;
-    Ok(resp.ok && resp.data.get("pong").and_then(|p| p.as_bool()) == Some(true))
+    Ok(pong_data(resp))
 }
 
 fn pid_belongs_to_daemon(pid_file: &PidFile) -> Result<bool> {

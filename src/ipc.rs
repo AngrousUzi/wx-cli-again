@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 /// CLI 向 daemon 发送的请求（换行符分隔 JSON，与 Python 版兼容）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +253,31 @@ impl Response {
     pub fn to_json_line(&self) -> anyhow::Result<String> {
         let s = serde_json::to_string(self)?;
         Ok(s + "\n")
+    }
+}
+
+/// 可执行文件指纹。daemon 启动时记下自身二进制的指纹，Ping 时回传；
+/// CLI 发现磁盘上同一路径的文件已变（重新编译 / 安装覆盖）就重启 daemon。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExeStamp {
+    pub path: PathBuf,
+    pub len: u64,
+    pub mtime_ns: u64,
+}
+
+impl ExeStamp {
+    pub fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some(Self {
+            path: path.to_path_buf(),
+            len: meta.len(),
+            mtime_ns: mtime.as_nanos() as u64,
+        })
+    }
+
+    pub fn current() -> Option<Self> {
+        Self::of(&std::env::current_exe().ok()?)
     }
 }
 

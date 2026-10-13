@@ -54,18 +54,46 @@ logged (the chunk is not retried); the next frame starts a new cycle at seq 0.
    $EDITOR .env        # set OBSIDIAN_URL and OBSIDIAN_SERVICE_KEY
    ```
 
-3. Make sure `wx` works on this machine (`wx biz-articles --json -n 1`). If it
-   is not on PATH, set `WX_BIN` in `.env`.
-4. Install the systemd user unit (expects the repo at `~/wx-cli`):
+3. Make sure `wx` has been initialized for this user (`wx init`, keys extracted).
+4. Deploy (expects the repo at `~/wx-cli`; needs rustup):
 
    ```
-   mkdir -p ~/.config/systemd/user
-   cp wx-rss-bridge.service ~/.config/systemd/user/
-   systemctl --user daemon-reload
-   systemctl --user enable --now wx-rss-bridge
+   ~/wx-cli/rss-bridge/deploy.sh
    loginctl enable-linger "$USER"     # keep it running without a login session
    journalctl --user -u wx-rss-bridge -f
    ```
+
+## Deploying updates
+
+Nothing on the host is a copy: the runtime files are symlinks into the checkout,
+so the checkout is the only thing to update.
+
+```
+git pull (in ~/wx-cli)
+   -> .git/hooks/post-merge -> rss-bridge/deploy.sh
+        cargo on PATH  ~/.bashrc (above the interactive guard) and ~/.profile source ~/.cargo/env
+        wx binary      cargo build --release --locked -> ~/.cargo/bin/wx (replaced only if it changed);
+                       ~/.local/bin/wx and /usr/local/bin/wx must be symlinks to it
+        symlinks       ~/.config/systemd/user/wx-rss-bridge.service  -> rss-bridge/wx-rss-bridge.service
+                       ~/.config/autostart/wechat.desktop             -> rss-bridge/autostart/wechat.desktop
+                       ~/.config/autostart/wx-login-tap.desktop       -> rss-bridge/autostart/wx-login-tap.desktop
+                       ~/.local/bin/wx-login-tap.py                   -> rss-bridge/autostart/wx-login-tap.py
+        wx daemon      stopped if it runs a replaced binary; `wx biz-articles -n 1` restarts it and proves it works
+        bridge         daemon-reload; restarted if bridge.py, the unit or .env changed after it started
+```
+
+```
+rss-bridge/deploy.sh --check     # report drift only, exit 1 if anything is stale
+rss-bridge/deploy.sh --pull      # git pull --ff-only, then deploy
+rss-bridge/deploy.sh --restart   # also restart the daemon and the bridge if current
+WX_NO_DEPLOY=1 git pull          # pull without deploying
+```
+
+A copy it replaces is moved to `~/.local/state/wx-cli/replaced/` when its content
+differed from the checkout. The unit pins `PATH` to `~/.cargo/bin` first, so the
+bridge runs the deployed `wx` whatever PATH the desktop session imported. The
+`wx` CLI also restarts the daemon by itself when the daemon's binary has been
+replaced on disk since it started (`wx daemon status` shows it).
 
 ## One-shot modes
 
@@ -91,8 +119,8 @@ auth-off service).
 - **403 (scope)**: the key lacks `obsidian:feed`. Mint a key with that scope.
 - **403 with body `error code: 1010`**: Cloudflare blocked the User-Agent. The
   bridge sends `wx-rss-bridge/1.0`; check for a proxy rewriting it.
-- **`wx binary not found`**: install `wx` or set `WX_BIN` to its full path. Under
-  systemd the PATH is minimal, so a full path is the safe choice.
+- **`wx binary not found`**: run `deploy.sh` (it builds `~/.cargo/bin/wx`, which
+  the unit puts first on PATH), or set `WX_BIN` to a full path in `.env`.
 - **`wx exited with code ...`**: the log shows the first 500 characters of
   stderr. The usual cause is the wx daemon not being initialized (keys not
   extracted). Run `wx init` as the same user and retry `wx biz-articles --json -n 1`.
@@ -110,7 +138,7 @@ The bridge survives a reboot (systemd user unit + linger), but new articles only
 arrive while the WeChat client is running and logged in. On the Ubuntu 24.04 /
 GNOME host the deb has no autostart setting, and after launch it still waits on
 the 进入微信 button even with auto-login approved on the phone. `autostart/`
-holds the pieces that close that gap:
+holds the pieces that close that gap; `deploy.sh` symlinks them into place:
 
 - `wechat.desktop` → `~/.config/autostart/`: launches WeChat with the session
   (GDM auto-login is already on for the user).

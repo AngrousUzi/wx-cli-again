@@ -146,7 +146,12 @@ async fn dispatch(req: Request, db: &DbCache, names: &tokio::sync::RwLock<Arc<Na
     };
 
     match req {
-        Ping => Response::ok(serde_json::json!({ "pong": true })),
+        Ping => Response::ok(serde_json::json!({
+            "pong": true,
+            "pid": std::process::id(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "exe": super::startup_exe_stamp(),
+        })),
         Sessions {
             limit,
             with_meta,

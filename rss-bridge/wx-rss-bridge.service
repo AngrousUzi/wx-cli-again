@@ -6,6 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/wx-cli/rss-bridge
+# Fixed PATH: `wx` is ~/.cargo/bin/wx (what deploy.sh builds), whatever PATH the
+# desktop session imported into the user manager.
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/env python3 bridge.py
 Restart=always
 RestartSec=5

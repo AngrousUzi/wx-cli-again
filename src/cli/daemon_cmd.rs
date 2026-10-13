@@ -12,9 +12,13 @@ pub fn cmd_daemon(cmd: DaemonCommands) -> Result<()> {
 }
 
 fn cmd_status() -> Result<()> {
-    if transport::is_alive() {
-        let pid_path = config::pid_path();
-        let pid = std::fs::read_to_string(&pid_path)
+    let Some(pong) = transport::ping() else {
+        println!("wx-daemon 未运行");
+        return Ok(());
+    };
+    let pid = match pong.get("pid").and_then(|p| p.as_u64()) {
+        Some(pid) => pid.to_string(),
+        None => std::fs::read_to_string(config::pid_path())
             .map(|s| {
                 serde_json::from_str::<serde_json::Value>(&s)
                     .ok()
@@ -22,10 +26,15 @@ fn cmd_status() -> Result<()> {
                     .map(|pid| pid.to_string())
                     .unwrap_or_else(|| s.trim().to_string())
             })
-            .unwrap_or_else(|_| "?".into());
-        println!("wx-daemon 运行中 (PID {})", pid);
-    } else {
-        println!("wx-daemon 未运行");
+            .unwrap_or_else(|_| "?".into()),
+    };
+    println!("wx-daemon 运行中 (PID {})", pid);
+    if let Some(exe) = pong.pointer("/exe/path").and_then(|p| p.as_str()) {
+        let version = pong.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+        println!("  二进制: {} (v{})", exe, version);
+    }
+    if let Some(reason) = transport::stale_reason(&pong) {
+        println!("  daemon {}，下一次查询会自动重启它", reason);
     }
     Ok(())
 }

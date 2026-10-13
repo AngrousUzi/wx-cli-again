@@ -6,9 +6,10 @@ pub mod shard_meta;
 
 use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::config;
+use crate::ipc::ExeStamp;
 
 fn normalized_rel_key(rel_key: &str) -> String {
     rel_key.replace('\\', "/")
@@ -43,10 +44,18 @@ pub(crate) fn collect_db_keys(
     keys
 }
 
+/// daemon 启动时自身二进制的指纹，Ping 时回传（CLI 据此发现 daemon 在跑旧二进制）
+pub(crate) fn startup_exe_stamp() -> Option<&'static ExeStamp> {
+    static STAMP: OnceLock<Option<ExeStamp>> = OnceLock::new();
+    STAMP.get_or_init(ExeStamp::current).as_ref()
+}
+
 /// daemon 入口
 ///
 /// 当 WX_DAEMON_MODE 环境变量设置时，main() 调用此函数
 pub fn run() {
+    // 尽早取指纹：之后文件再被替换，指纹仍对应正在运行的这份代码
+    startup_exe_stamp();
     let rt = tokio::runtime::Runtime::new().expect("无法创建 tokio runtime");
     if let Err(e) = rt.block_on(async_run()) {
         eprintln!("[daemon] 启动失败: {}", e);
