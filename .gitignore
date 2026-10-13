@@ -17,6 +17,7 @@ run_hook.bat
 
 # Rust
 target/
+/.cargo/
 
 # Python
 __pycache__/
