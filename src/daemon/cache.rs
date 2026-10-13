@@ -155,6 +155,19 @@ impl DbCache {
         Ok(())
     }
 
+    /// 构建解密产物；失败（多为与 WeChat checkpoint 重叠读到撕裂页）时整体重来一次。
+    /// closure 必须自行从干净 temp 开始。
+    fn build_with_one_retry(rel_key: &str, mut build: impl FnMut() -> Result<()>) -> Result<()> {
+        match build() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("[cache] 解密产物探测失败，重读一次 {}: {:#}", rel_key, e);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                build().with_context(|| format!("重读一次仍失败: {}", rel_key))
+            }
+        }
+    }
+
     /// temp → final。Unix 上 rename 替换后旧 fd 仍指向旧 inode；Windows 先删目标。
     fn atomic_install_cache(tmp: &Path, final_path: &Path) -> Result<()> {
         #[cfg(windows)]
@@ -536,18 +549,21 @@ impl DbCache {
                 let tmp2 = tmp.clone();
                 let wal_path2 = wal_path.clone();
                 let key_copy = enc_key_bytes;
+                let rel_key2 = rel_key.to_string();
                 tokio::task::spawn_blocking(move || {
-                    if tmp2.exists() {
-                        let _ = std::fs::remove_file(&tmp2);
-                    }
-                    std::fs::copy(&out_src, &tmp2).with_context(|| {
-                        format!("复制缓存到 temp 失败: {}", out_src.display())
-                    })?;
-                    if wal_path2.exists() {
-                        wal::apply_wal(&wal_path2, &tmp2, &key_copy)?;
-                    }
-                    Self::probe_decrypted_db(&tmp2)?;
-                    Ok::<_, anyhow::Error>(())
+                    Self::build_with_one_retry(&rel_key2, || {
+                        if tmp2.exists() {
+                            let _ = std::fs::remove_file(&tmp2);
+                        }
+                        std::fs::copy(&out_src, &tmp2).with_context(|| {
+                            format!("复制缓存到 temp 失败: {}", out_src.display())
+                        })?;
+                        if wal_path2.exists() {
+                            wal::apply_wal(&wal_path2, &tmp2, &key_copy)?;
+                        }
+                        Self::probe_decrypted_db(&tmp2)?;
+                        Ok(())
+                    })
                 })
                 .await??;
                 eprintln!(
@@ -585,6 +601,7 @@ impl DbCache {
         let tmp2 = tmp.clone();
         let wal_path3 = wal_path.clone();
         let key_copy = enc_key_bytes;
+        let rel_key3 = rel_key.to_string();
         tokio::task::spawn_blocking(move || {
             if !crypto::validate_raw_key_for_db(&db_path2, &key_copy) {
                 anyhow::bail!(
@@ -593,15 +610,17 @@ impl DbCache {
                     crate::config::RECOMMENDED_KEY_EXTRACT
                 );
             }
-            if tmp2.exists() {
-                let _ = std::fs::remove_file(&tmp2);
-            }
-            crypto::full_decrypt(&db_path2, &tmp2, &key_copy)?;
-            if wal_path3.exists() {
-                wal::apply_wal(&wal_path3, &tmp2, &key_copy)?;
-            }
-            Self::probe_decrypted_db(&tmp2)?;
-            Ok::<_, anyhow::Error>(())
+            Self::build_with_one_retry(&rel_key3, || {
+                if tmp2.exists() {
+                    let _ = std::fs::remove_file(&tmp2);
+                }
+                crypto::full_decrypt(&db_path2, &tmp2, &key_copy)?;
+                if wal_path3.exists() {
+                    wal::apply_wal(&wal_path3, &tmp2, &key_copy)?;
+                }
+                Self::probe_decrypted_db(&tmp2)?;
+                Ok(())
+            })
         })
         .await??;
 
@@ -665,6 +684,43 @@ fn hex_to_32bytes(s: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_succeeds_on_second_attempt() {
+        let calls = std::cell::Cell::new(0);
+        let r = DbCache::build_with_one_retry("k", || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                anyhow::bail!("torn");
+            }
+            Ok(())
+        });
+        assert!(r.is_ok());
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn retry_fails_after_two_attempts() {
+        let calls = std::cell::Cell::new(0);
+        let r = DbCache::build_with_one_retry("k", || {
+            calls.set(calls.get() + 1);
+            anyhow::bail!("torn")
+        });
+        assert!(r.is_err());
+        assert!(format!("{:#}", r.unwrap_err()).contains("重读一次仍失败"));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn retry_not_used_on_immediate_success() {
+        let calls = std::cell::Cell::new(0);
+        let r = DbCache::build_with_one_retry("k", || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert!(r.is_ok());
+        assert_eq!(calls.get(), 1);
+    }
 
     /// 64 字符 hex（测试用假 key；Path3 会在 HMAC 校验处拒绝）
     const FAKE_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
